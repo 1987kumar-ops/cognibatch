@@ -1,0 +1,1537 @@
+You are a senior senior cloud resilience engineer on Azure 
+
+Design a resilience test plan for this Azure environment:
+the Azure environment created by terraform code @file:tflab 
+
+vm-app: Ubuntu 22.04, Standard_B2ms, private IP 10.0.1.10
+vm-db: Ubuntu 22.04, Standard_B2ms, private IP 10.0.2.10, PostgreSQL 14
+vm-win: Windows Server 2022, Standard_B2s, private IP 10.0.1.20
+Azure Bastion Basic (only access path — no public IPs on VMs)
+NSG: SSH/RDP allowed from Bastion subnet only (10.0.3.0/27)
+Storage: Standard LRS, soft-delete 7 days
+
+For each test scenario provide:
+  1. Scenario name and description
+  2. Failure being simulated
+  3. Exact command to trigger the failure (safe — reversible)
+  4. Expected impact on each component
+  5. Recovery command
+  6. Validation command (confirms recovery complete)
+  7. RTO target (how long recovery should take)
+
+Include these 5 scenarios:
+  A. vm-app CPU exhaustion (payment service under load)
+  B. DB connection pool exhaustion (max_connections reached)
+  C. Disk fill on vm-app (production write failures)
+  D. Network routing misconfiguration (app cannot reach DB)
+  E. Windows IIS service failure (reporting service down)
+
+Constraints:
+  - All tests must be reversible within 5 minutes
+  - No data loss during any test
+  - Include a 'go/no-go' check before each test
+
+Reviewing Terraform environment details to ensure commands align with actual resources and VM names.
+
+Read [](file:///c%3A/Users/labuser/Documents/Training/tflab/main.tf#1-1), lines 1 to 260
+
+Read [](file:///c%3A/Users/labuser/Documents/Training/tflab/output.tf)
+
+Read [](file:///c%3A/Users/labuser/Documents/Training/tflab/terraform.tfvars)
+
+Checking DB config to ensure service and connection commands match the deployed setup.
+
+Read [](file:///c%3A/Users/labuser/Documents/Training/tflab/cloud-init-db.yaml)
+
+## Azure Resilience Test Plan for tflab
+
+### Environment variables
+- Resource group: `rg-ailab-arunkumar`
+- App VM: `vm-app` (`10.0.1.10`)
+- DB VM: `vm-db` (`10.0.2.10`)
+- Windows VM: `vm-win` (`10.0.1.20`)
+- Bastion host: `bastion-ailab`
+- DB: PostgreSQL 14 on `vm-db`
+- Access method: Azure Bastion / Azure CLI remote run-command
+
+> Precondition for every test: `az login` and `az account set -s <subscription-id>`
+
+---
+
+## Standard go/no-go check (before each scenario)
+1. Verify VM power state:
+   ```bash
+   az vm get-instance-view -g rg-ailab-arunkumar -n vm-app --query "instanceView.statuses[?contains(code,'PowerState')].displayStatus" -o tsv
+   az vm get-instance-view -g rg-ailab-arunkumar -n vm-db --query "instanceView.statuses[?contains(code,'PowerState')].displayStatus" -o tsv
+   az vm get-instance-view -g rg-ailab-arunkumar -n vm-win --query "instanceView.statuses[?contains(code,'PowerState')].displayStatus" -o tsv
+   ```
+2. Verify Bastion provisioning:
+   ```bash
+   az network bastion show -g rg-ailab-arunkumar -n bastion-ailab --query provisioningState -o tsv
+   ```
+3. Verify no existing critical alerts or outages in the environment.
+4. Confirm there is a restore path and recovery window of 5 minutes.
+
+---
+
+## Scenario A: `vm-app` CPU exhaustion (payment service under load)
+
+1. Description  
+   Simulate sustained CPU saturation on `vm-app` to validate app resilience under compute pressure.
+
+2. Failure simulated  
+   `vm-app` CPU pegged at 100%, causing slow or failed app responses.
+
+3. Exact trigger command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "for i in \$(seq 1 2); do nohup yes > /dev/null 2>&1 & done"
+   ```
+
+4. Expected impact
+   - `vm-app`: high CPU, service response latency increases, requests may queue or fail.
+   - `vm-db`: should remain available, may experience some slower request processing only if app retries.
+   - `vm-win`: unaffected.
+   - Bastion: unaffected.
+   - NSGs/storage: unaffected.
+
+5. Recovery command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "pkill -f '^yes$' || true"
+   ```
+
+6. Validation command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "if pgrep -f '^yes$' >/dev/null; then exit 1; fi"
+   ```
+
+7. RTO target  
+   5 minutes
+
+---
+
+## Scenario B: DB connection pool exhaustion (`max_connections` reached)
+
+1. Description  
+   Simulate PostgreSQL reaching `max_connections=20` on `vm-db` and confirm app behavior under exhausted DB sessions.
+
+2. Failure simulated  
+   New database connections rejected with `too many connections`.
+
+3. Exact trigger command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-db --command-id RunShellScript --scripts "for i in \$(seq 1 20); do nohup sudo -u postgres psql -d labdb -c 'select pg_sleep(300);' > /tmp/db_conn_test_\$i.log 2>&1 & done"
+   ```
+
+4. Expected impact
+   - `vm-db`: accepts existing connections, rejects new ones.
+   - `vm-app`: database errors should appear for new requests, likely service errors or timeouts.
+   - `vm-win`: unaffected.
+   - Bastion: unaffected.
+   - Storage: unaffected.
+
+5. Recovery command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-db --command-id RunShellScript --scripts "pkill -f 'select pg_sleep(300)' || true"
+   ```
+
+6. Validation command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-db --command-id RunShellScript --scripts "sudo -u postgres psql -d labdb -c 'select 1'"
+   ```
+
+7. RTO target  
+   5 minutes
+
+---
+
+## Scenario C: Disk fill on `vm-app` (production write failures)
+
+1. Description  
+   Simulate root filesystem exhaustion on `vm-app` to validate app behavior when writes fail.
+
+2. Failure simulated  
+   App cannot write logs/temp files; write errors occur.
+
+3. Exact trigger command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "sudo fallocate -l 24G /tmp/vm_app_disk_fill_test || sudo dd if=/dev/zero of=/tmp/vm_app_disk_fill_test bs=1M count=24000"
+   ```
+
+4. Expected impact
+   - `vm-app`: write operations fail, service may show 500s or disk full errors.
+   - `vm-db`: unaffected.
+   - `vm-win`: unaffected.
+   - Bastion: unaffected.
+   - Storage: unaffected.
+
+5. Recovery command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "rm -f /tmp/vm_app_disk_fill_test"
+   ```
+
+6. Validation command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "df -h /tmp | awk 'NR==2 {print \$5}'"
+   ```
+
+7. RTO target  
+   5 minutes
+
+---
+
+## Scenario D: Network routing misconfiguration (`app` cannot reach `db`)
+
+1. Description  
+   Simulate a broken route/firewall on `vm-app` that blocks traffic to the DB IP.
+
+2. Failure simulated  
+   `vm-app` loses connectivity to `vm-db` at `10.0.2.10`.
+
+3. Exact trigger command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "sudo iptables -A OUTPUT -d 10.0.2.10 -j DROP"
+   ```
+
+4. Expected impact
+   - `vm-app`: cannot establish DB connections, app errors on database access.
+   - `vm-db`: remains healthy and reachable from other hosts.
+   - `vm-win`: unaffected.
+   - Bastion: unaffected.
+   - NSGs/storage: unchanged.
+
+5. Recovery command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "sudo iptables -D OUTPUT -d 10.0.2.10 -j DROP || true"
+   ```
+
+6. Validation command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts "bash -c 'if timeout 5 bash -c \"cat < /dev/tcp/10.0.2.10/5432\" >/dev/null 2>&1; then echo CONNECTED; else echo BLOCKED; fi'"
+   ```
+
+7. RTO target  
+   5 minutes
+
+---
+
+## Scenario E: Windows IIS service failure (`vm-win` reporting service down)
+
+1. Description  
+   Simulate the Windows reporting service shutdown by stopping IIS on `vm-win`.
+
+2. Failure simulated  
+   `W3SVC` (IIS) service stops, making reporting/UI unavailable.
+
+3. Exact trigger command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-win --command-id RunPowerShellScript --scripts "Stop-Service W3SVC -Force"
+   ```
+
+4. Expected impact
+   - `vm-win`: IIS is down, reporting/service web endpoint unavailable.
+   - `vm-app`: unaffected unless it depends on `vm-win`.
+   - `vm-db`: unaffected.
+   - Bastion: unaffected.
+   - Storage: unaffected.
+
+5. Recovery command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-win --command-id RunPowerShellScript --scripts "Start-Service W3SVC"
+   ```
+
+6. Validation command
+   ```bash
+   az vm run-command invoke -g rg-ailab-arunkumar -n vm-win --command-id RunPowerShellScript --scripts "Get-Service W3SVC | Select-Object -ExpandProperty Status"
+   ```
+
+7. RTO target  
+   5 minutes
+
+---
+
+## Notes
+- All scenarios are reversible with non-destructive commands.
+- Recovery commands are designed to complete within 5 minutes.
+- No data deletion is performed.
+- Use the Azure CLI `az vm run-command invoke` method because access is via Bastion and VMs have no public IPs.
+
+---------------------------------------------
+You are a senior cloud resilience engineer specialising in Azure infrastructure.
+
+Analyse this environment created by terraform code @file:tflab  and design a comprehensive resilience test plan.
+Choose the scenarios YOU consider most important for this environment — do not
+limit yourself to any specific number. update the existing documents
+
+Environment:
+  - vm-app (10.0.1.10): Ubuntu 22.04, payment service (Java, -Xmx4g)
+  - vm-db  (10.0.2.10): Ubuntu 22.04, PostgreSQL 14, max_connections=20
+  - vm-win (10.0.1.20): Windows Server 2022, IIS reporting service
+  - Azure Bastion Basic SKU: only remote access path (no public IPs on VMs)
+  - NSG: SSH/RDP from Bastion subnet (10.0.3.0/27) only
+  - NSG: PostgreSQL port 5432 from app subnet (10.0.1.0/24) only
+  - Storage: Standard LRS, soft-delete 7 days
+  - Auto-shutdown: all VMs stop at 20:00 UTC daily
+
+For EACH scenario you design, provide:
+
+  SCENARIO [LETTER]: [Name]
+  Description:     What failure condition this simulates and why it is realistic
+  Failure type:    COMPUTE / NETWORK / DATABASE / STORAGE / APPLICATION
+  Blast radius:    Which components are affected and how severely
+  Go/No-Go check:  Command to run BEFORE triggering — confirms clean starting state
+  Trigger:         Exact command(s) to create the failure condition
+  Expected impact: What each VM and service experiences during the test
+  Recovery:        Exact command(s) to restore normal state
+  Validation:      Exact command to confirm full recovery
+  RTO target:      How long recovery should take
+
+Constraints on ALL scenarios:
+  - Every test MUST be reversible within 5 minutes
+  - No permanent data loss
+  - No commands that require a VM rebuild to recover
+  - All trigger and recovery commands must be specific and executable
+    (not descriptions — actual runnable bash or PowerShell commands)
+  - Bastion is the only access path — all commands must work via SSH/RDP
+    through Bastion or via az vm run-command from Cloud Shell
+
+After all scenarios, provide:
+  PRIORITY ORDER: Rank the scenarios by risk to the payment service
+  DEPENDENCY MAP: Which scenarios should be run BEFORE others
+  KNOWN GAPS:     What resilience risks exist in this environment that
+                  CANNOT be safely tested in a lab (and why)
+
+
+
+Reviewing workspace files and existing documentation so the plan integrates with current repo.
+
+Read [](file:///c%3A/Users/labuser/Documents/Training/tflab)
+
+Adding the resilience test plan document to capture analysis and executable scenarios for this Azure lab.
+
+Created [](file:///c%3A/Users/labuser/Documents/Training/tflab/resilience_test_plan.md)
+
+✅ Created resilience_test_plan.md with a comprehensive Azure resilience test plan tailored to your Terraform environment.
+
+Highlights:
+- Added 6 executable scenarios with full trigger/recovery/validation commands
+- Included go/no-go checks, RTO targets, priority ranking, dependency map, and known gaps
+- Ensured all tests are reversible within 5 minutes and avoid permanent data loss
+
+Made changes.
+
+----------------------------------------------------------
+You are a senior infrastructure on-call engineer.
+
+A monitoring system has fired 280 alerts over 8 minutes on the FinBridge Azure payment environment.
+Analyse ALL of the following alerts and answer:
+
+1. FIRST ALERT: What was the very first alert by timestamp? Which resource fired it?
+
+2. ROOT CAUSE CANDIDATES: List the top 3 most likely root causes in order of probability.
+   For each, state which specific alert IDs support it.
+
+3. NOISE: Which alerts are downstream symptoms rather than causes?
+   State your reasoning for each one you classify as noise.
+
+4. CHANGE EVENT: Is there evidence of a configuration change in the alert data?
+   What changed, when, and who made the change?
+
+5. TIMELINE: Reconstruct the incident timeline from first alert to peak impact.
+   Format each line as:
+   HH:MM:SS | Tower | Event | Impact on payment service
+
+6. SINGLE ROOT CAUSE: State the single most likely root cause in one sentence.
+
+7. FIRST ACTION: What is the single most important action the on-call engineer
+   should take in the next 60 seconds?
+
+Constraints:
+  - ONLY use information present in the alert data below
+  - Do not assume context not visible in the alerts
+  - If evidence is insufficient, state: insufficient evidence
+  - Highlight any alert that contradicts your root cause hypothesis
+
+--- ALERT DATA ---
+[WAVE 1 — 09:14:00–09:14:59 — 12 alerts]
+[CRIT] —     —            —                —
+[WARN] ALT-001  09:14:03  nsg-app          NSG-RuleChanged
+       NSG rule 'AllowPostgres' modified. Old source: 10.0.1.0/24. New source: 10.0.0.0/16. Priority changed from 100 to 50. Changed by: network-admin@finbridge.internal
+[INFO] ALT-002  09:14:03  nsg-app          NSG-FlowLogAnomaly
+       Unusual inbound rule modification. Rule priority changed from 100 to 50. Source scope widened.
+[INFO] ALT-003  09:14:05  vnet-ailab       VNet-TopologyChange
+       VNet flow topology change recorded. Affected subnets: snet-app, snet-db.
+[INFO] ALT-004  09:14:08  vm-db            DB-ConnMonitor
+       pg_stat_activity baseline: 3/20 connections. Monitoring threshold: 16/20.
+[INFO] ALT-005  09:14:09  vm-app           AppHealth
+       Payment service health check: HTTP 200. Response time: 12ms (baseline).
+[INFO] ALT-006  09:14:12  pip-bastion      Bastion-ConnLog
+       Admin session opened: network-admin@finbridge.internal. Duration: 2m14s. Action: NSG modification.
+[WARN] ALT-007  09:14:47  vm-app           AppConnTimeout
+       Payment service DB connection timed out after 3000ms. Target: 10.0.2.10:5432. Retry 1/3.
+[WARN] ALT-008  09:14:47  vm-app           AppConnTimeout
+       Payment service DB connection timed out after 3000ms. Target: 10.0.2.10:5432. Retry 2/3.
+[WARN] ALT-009  09:14:48  vm-app           AppConnTimeout
+       Payment service DB connection timed out after 3000ms. Target: 10.0.2.10:5432. Retry 3/3 — giving up.
+[WARN] ALT-010  09:14:52  vm-db            PG-ConnDrop
+       Unexpected connection drop from 10.0.1.10. Client disconnected without clean close. PID 12341.
+[WARN] ALT-011  09:14:54  vm-db            PG-ConnDrop
+       Unexpected connection drop from 10.0.1.10. Client disconnected without clean close. PID 12342.
+[INFO] ALT-012  09:14:58  stailab          Storage-WriteLatency
+       Azure Storage write latency elevated: 48ms (normal: 4ms). Container: lab-data. 3 ops affected.
+
+[WAVE 2 — 09:15:00–09:15:59 — 41 alerts]
+[WARN] ALT-013  09:15:01  vm-app           AppErrorRate
+       Payment service error rate: 34% (threshold: 5%). HTTP 503 responses increasing.
+[WARN] ALT-014  09:15:02  vm-db            PG-ConnCount
+       Active connections: 8/20. 6 connections in 'idle in transaction' state > 30 seconds.
+[WARN] ALT-015  09:15:08  vm-app           AppConnTimeout
+       Payment service DB connection timeout. Retry pool exhausted. Queuing 12 transactions.
+[WARN] ALT-016  09:15:12  vm-db            PG-SlowQuery
+       Long running query: 8432ms. SELECT c.name, COUNT(o.id) FROM customers JOIN orders... PID 12344.
+[WARN] ALT-017  09:15:15  vm-app           CPU-Elevated
+       vm-app CPU: 42% (threshold: 40%). Process: java PID 18821 consuming 38%. Retry storm pattern.
+[WARN] ALT-018  09:15:17  vm-db            PG-ConnCount
+       Active connections: 12/20. Growth rate: +4/minute.
+[WARN] ALT-019  09:15:20  vm-win           IIS-ResponseTime
+       IIS /api/reports/daily response time: 12400ms (threshold: 3000ms). DB dependency timeout.
+[WARN] ALT-020  09:15:22  vm-app           AppMemory
+       Payment service JVM heap: 78% (threshold: 75%). GC overhead: 18%. Connection retry storm pattern.
+[WARN] ALT-021  09:15:28  vm-db            PG-LockWait
+       Lock wait: PID 12346 waiting for ShareLock held by PID 12341. Wait time: 28s.
+[WARN] ALT-022  09:15:31  vm-app           AppConnTimeout
+       [x8 repetitions] Payment service DB connection timeout. 10.0.2.10:5432 unreachable.
+[WARN] ALT-023  09:15:35  vm-db            PG-ConnCount
+       Active connections: 16/20. ALERT THRESHOLD REACHED. Connections approaching maximum.
+[WARN] ALT-024  09:15:38  vm-app           DiskIOPS
+       vm-app disk IOPS: 840 (threshold: 500). Cause: high log write volume from error storm.
+[WARN] ALT-025  09:15:44  vm-db            PG-Deadlock
+       Deadlock detected between PID 12341 and PID 12342. Both waiting for ShareLock. Rolled back.
+[WARN] ALT-026  09:15:47  vm-win           EventLog-Error
+       Event ID 7034: IIS App Pool 'FinBridgeReporting' stopped unexpectedly. Restart pending.
+[INFO] ALT-027  09:15:50  vm-db            PG-ConnCount
+       Active connections: 18/20. Warning: 2 connections remaining before max_connections.
+[WARN] ALT-028  09:15:52  stailab          Storage-IOLatency
+       Azure Storage I/O latency: 284ms (threshold: 20ms). DB WAL archive writes delayed.
+[WARN] ALT-029  09:15:55  vm-app           AppErrorRate
+       Payment service error rate: 67%. HTTP 503. 23 transactions queued, 0 completing.
+
+[WAVE 3 — 09:16:00–09:16:59 — 84 alerts]
+[CRIT] ALT-030  09:16:01  vm-db            PG-ConnExhausted
+       FATAL: sorry, too many clients already. max_connections=20 reached. New connections REFUSED.
+[CRIT] ALT-031  09:16:01  vm-app           AppPaymentFailed
+       Payment transaction TX-44821 FAILED. PSQLException: FATAL too many clients. Customer impact CONFIRMED.
+[CRIT] ALT-032  09:16:02  vm-app           AppPaymentFailed
+       [x12 in 2 seconds] Payment transaction FAILED.
+[CRIT] ALT-033  09:16:03  vm-db            PG-ConnExhausted
+       [x18 repetitions in 60s] FATAL: sorry, too many clients already.
+[CRIT] ALT-034  09:16:05  vm-app           CPU-Critical
+       vm-app CPU: 94% (threshold: 90%). java PID 18821. Pattern: connection retry + GC loop.
+[CRIT] ALT-035  09:16:08  vm-app           AppMemory
+       Payment service JVM heap: 91% (threshold: 85%). GC overhead: 34%. OOM risk in <5 minutes.
+[WARN] ALT-036  09:16:10  vm-win           IIS-AppPoolFailed
+       IIS App Pool 'FinBridgeReporting' restart failed. DB connection unavailable. State: Stopped.
+[CRIT] ALT-037  09:16:15  vm-app           HealthCheck-Failed
+       Payment service health check: HTTP 503. Timeout >10s. Service DEGRADED.
+[WARN] ALT-038  09:16:18  vm-db            PG-WALLag
+       PostgreSQL WAL archive lag: 847ms (normal: <100ms). WAL writer blocked by connection storm.
+[CRIT] ALT-039  09:16:22  vm-app           AppPaymentFailed
+       Payment service DEGRADED: 89% transactions failing. 47 queued, 0 completing.
+[WARN] ALT-040  09:16:30  stailab          Storage-Throughput
+       Azure Storage throughput: 0.2 MB/s (normal: 4 MB/s). DB WAL archiving stalled.
+[INFO] ALT-041  09:16:35  nsg-app          NSG-FlowDenied
+       [x156 in 60s] DENY inbound 10.0.1.10 → 10.0.2.10:5432. Rule: DenyAllInbound (default).
+[CRIT] ALT-042  09:16:40  vm-db            PG-ServiceDegraded
+       PostgreSQL accepting no new connections. 47 application transactions queued at pool.
+[WARN] ALT-043  09:16:44  vm-win           EventLog-Error
+       Event ID 1001: IIS worker crash. System.Data.SqlClient.SqlException: DB connection refused.
+[CRIT] ALT-044  09:16:50  vm-app           AppMemory-OOM
+       Payment service JVM OOM imminent. Heap: 97%. GC overhead: 52%. Full GC every 800ms.
+
+[WAVE 4 — 09:17:00–09:22:00 — 143 alerts]
+[CRIT] ALT-045  09:17:01  vm-app           Service-Crashed
+       Payment service PID 18821 terminated. OOM: Java heap space. Automatic restart initiated.
+[CRIT] ALT-046  09:17:03  vm-app           HealthCheck-Failed
+       [x43 repetitions 09:17–09:22] Payment service: HTTP 503. Service unavailable.
+[CRIT] ALT-047  09:17:08  vm-db            PG-ConnExhausted
+       [x67 repetitions 09:17–09:22] FATAL: sorry, too many clients already.
+[WARN] ALT-048  09:17:12  vm-app           AppRestartLoop
+       Payment service restart attempt 1/3. Restarting... DB connection check pending.
+[CRIT] ALT-049  09:17:14  vm-app           AppRestartFailed
+       Payment service restart FAILED. Cannot establish DB connection. 10.0.2.10:5432 unreachable.
+[WARN] ALT-050  09:17:30  vm-app           AppRestartLoop
+       Payment service restart attempt 2/3...
+[CRIT] ALT-051  09:17:33  vm-app           AppRestartFailed
+       Payment service restart FAILED. DB still unreachable.
+[INFO] ALT-052  09:18:00  nsg-app          NSG-FlowDenied
+       [x312 cumulative] DENY 10.0.1.10 → 10.0.2.10:5432. DenyAllInbound default rule.
+
+[228 additional alerts — repetitions of above patterns — 09:17–09:22 UTC]
+
+ALERT SUMMARY: 47 CRITICAL | 138 WARNING | 95 INFO | Total: 280
+ENVIRONMENT: FinBridge payment infrastructure on Azure
+BUDGET IMPACT: Payment volume ~$2,400/minute
+
+
+
+---
+
+## 1. FIRST ALERT
+- First structured alert by timestamp: `09:14:03`
+- Alert ID: `ALT-001`
+- Resource: `nsg-app`
+- Description: `NSG-RuleChanged`
+
+> Note: there is a preceding unlabeled `[CRIT]` line with no details, so the first actionable alert in the data is `ALT-001`.
+
+---
+
+## 2. ROOT CAUSE CANDIDATES
+
+1. **NSG/network configuration change causing DB connectivity disruption**
+   - Supporting alerts:
+     - `ALT-001` NSG rule modified on `nsg-app`
+     - `ALT-002` flow log anomaly from the NSG change
+     - `ALT-003` VNet topology change recorded
+     - `ALT-041` repeated DENY 10.0.1.10 → 10.0.2.10:5432
+     - `ALT-052` cumulative DENY flow evidence
+
+2. **PostgreSQL connection/resource exhaustion**
+   - Supporting alerts:
+     - `ALT-014` active connections 8/20 with 6 idle-in-transaction
+     - `ALT-018` active connections 12/20
+     - `ALT-023` active connections 16/20
+     - `ALT-030` max_connections=20 reached
+     - `ALT-033` repeated connection exhaustion
+     - `ALT-042` PostgreSQL accepting no new connections
+     - `ALT-047` repeated PG-ConnExhausted
+
+3. **Application retry/memory failure cascade**
+   - Supporting alerts:
+     - `ALT-017` vm-app CPU elevated due to retry storm
+     - `ALT-020` JVM heap 78% with GC overhead
+     - `ALT-024` disk IOPS high from error storm
+     - `ALT-034` vm-app CPU critical
+     - `ALT-035` JVM heap 91% OOM risk
+     - `ALT-044` AppMemory-OOM imminent
+     - `ALT-045` payment service crashed
+
+---
+
+## 3. NOISE (downstream symptoms)
+
+- `ALT-005` AppHealth HTTP 200 at 09:14:09
+  - Reason: baseline healthy check before the incident, not causal.
+
+- `ALT-012` Storage write latency elevated
+  - Reason: likely downstream from DB WAL backlog and transaction storm, not the initiating fault.
+
+- `ALT-019` IIS response time high
+- `ALT-026` IIS App Pool stopped unexpectedly
+- `ALT-036` IIS restart failed due to DB connection unavailable
+- `ALT-043` IIS worker crash from SQL exception
+  - Reason: all are downstream consequences of DB connectivity failures, not primary causes.
+
+- `ALT-021` PG-LockWait
+- `ALT-025` PG-Deadlock
+  - Reason: symptoms of high DB contention and retry storm rather than initiating the outage.
+
+- `ALT-024` DiskIOPS high on `vm-app`
+  - Reason: caused by error-log volume from the app failure storm.
+
+- `ALT-038` WAL lag
+- `ALT-040` Storage throughput stall
+  - Reason: downstream effects of DB overload and blocked WAL archiving.
+
+---
+
+## 4. CHANGE EVENT
+- Yes, there is clear evidence of a configuration change.
+- Changed at: `09:14:03`
+- What changed: NSG rule `AllowPostgres` on `nsg-app`
+  - Old source: `10.0.1.0/24`
+  - New source: `10.0.0.0/16`
+  - Priority changed from `100` to `50`
+- Changed by: `network-admin@finbridge.internal`
+
+---
+
+## 5. TIMELINE
+
+- `09:14:03 | Network | NSG rule changed on nsg-app | Potential DB path change begins`
+- `09:14:47 | App | first DB connection timeouts to 10.0.2.10:5432 | Payment service starts degrading`
+- `09:15:01 | App | error rate spikes to 34% | Customer-facing failures escalate`
+- `09:15:15 | DB | retries exhaust connection pool | throughput impaired`
+- `09:16:01 | DB | max_connections hit and new clients refused | payments fail confirmed`
+- `09:16:35 | Network | repeated DENY logs for app→db traffic | network-level block confirmed`
+- `09:17:01 | App | payment service crashes from OOM restart loop | service unavailable
+
+---
+
+## 6. SINGLE MOST LIKELY ROOT CAUSE
+A recent NSG configuration change on `nsg-app` at `09:14:03` likely disrupted app-to-DB connectivity and triggered a cascading DB connection exhaustion and payment-service outage.
+
+> Contradiction: `ALT-001` shows the rule source was widened, which would not normally block traffic, so this suggests the change was misapplied or caused an unintended rule ordering problem.
+
+---
+
+## 7. FIRST ACTION
+Immediately inspect and restore the DB allow rule in the relevant NSG (rollback the `09:14:03` `AllowPostgres` change on `nsg-app` / validate the effective rule ordering for `10.0.1.10 → 10.0.2.10:5432`) to recover payment connectivity.
+---------------------------
+Using ONLY the alert data from the previous prompt, reconstruct the full incident timeline.
+
+Format each event as:
+  HH:MM:SS | Tower | Event description | Downstream impact
+
+After the timeline answer:
+
+1. TOTAL TIME: How long from the root cause event to the first CRITICAL alert?
+
+2. POINT OF NO RETURN: At what exact timestamp did payment transactions start
+   failing irreversibly? (i.e. when did the first customer-facing failure occur?)
+
+3. MISSING ALERT: What single monitoring alert, if it had fired BEFORE the cascade,
+   would have allowed the engineer to prevent the incident?
+   Write the exact Azure Monitor alert rule definition including:
+     - Signal type
+     - Condition
+     - Threshold
+     - Evaluation period
+     - Severity
+
+4. BLAST RADIUS at peak impact (09:17:00):
+   - Services fully down
+   - Services degraded
+   - Estimated transactions failed (assuming 2,400/minute normal volume)
+   - Estimated revenue impact
+
+5. CONTRADICTIONS: List any alert in the dataset that does NOT fit your root cause
+   hypothesis. Explain what it might indicate instead.
+
+----
+
+
+09:14:03 | Network | `nsg-app` rule `AllowPostgres` modified, priority lowered and source widened | Potential DB access policy change begins
+09:14:03 | Network | `nsg-app` flow log anomaly detected for the NSG rule change | Confirms suspicious security rule change event
+09:14:05 | Network | VNet topology change recorded affecting `snet-app` and `snet-db` | Possible network path or policy impact
+09:14:08 | DB | PostgreSQL connection baseline normal at 3/20 | DB healthy before incident
+09:14:09 | App | Payment service health check returns HTTP 200 | Service still healthy
+09:14:12 | Bastion | Admin Bastion session opened by `network-admin@finbridge.internal` for NSG modification | Manual change path confirmed
+09:14:47 | App | First DB connection timeout to `10.0.2.10:5432` | Payment requests begin timing out
+09:14:52 | DB | Unexpected client connection drop from `10.0.1.10` | DB session instability begins
+09:14:54 | DB | Second unexpected client disconnect from `10.0.1.10` | Connection instability continues
+09:14:58 | Storage | Azure Storage write latency elevated | Early downstream storage impact begins
+09:15:01 | App | Payment service error rate spikes to 34% with 503s | Customer-facing failures begin
+09:15:02 | DB | Active connections 8/20 with 6 idle-in-transaction | DB session load rising
+09:15:08 | App | DB timeout exhausts retry pool, 12 transactions queued | Request backlog grows
+09:15:12 | DB | Long-running query 8.4s detected | DB performance degrades
+09:15:15 | App | CPU elevated to 42% with retry storm pattern | App compute stress increases
+09:15:17 | DB | Active connections 12/20 | DB load continues upward
+09:15:20 | App | JVM heap 78%, GC overhead 18% | App memory pressure increases
+09:15:28 | DB | Lock wait 28s detected | DB contention emerges
+09:15:31 | App | Repeated DB timeouts; `10.0.2.10:5432` unreachable | App confirms DB connectivity failure
+09:15:35 | DB | Active connections 16/20 | DB nearing connection limit
+09:15:38 | App | Disk IOPS high from error log storm | App I/O stress increases
+09:15:44 | DB | Deadlock detected and rolled back | DB transaction conflict worsens
+09:15:47 | Windows | IIS App Pool `FinBridgeReporting` stopped unexpectedly | Reporting service impacted
+09:15:50 | DB | Active connections 18/20 | DB almost full
+09:15:52 | Storage | Azure Storage I/O latency 284ms due WAL delay | Storage degradation worsens
+09:15:55 | App | Error rate 67%, 23 queued, 0 completing | Payment service severely failing
+09:16:01 | DB | `max_connections=20` reached; new clients refused | DB rejects new connections
+09:16:01 | App | Payment transaction `TX-44821` fails with `too many clients` | First confirmed customer-facing payment failure
+09:16:02 | App | 12 payment failures in 2 seconds | Failure cascade intensifies
+09:16:03 | DB | Repeated `too many clients` errors | DB connection rejection persists
+09:16:05 | App | CPU critical at 94% with retry/GC loop | App enters critical state
+09:16:08 | App | JVM heap 91%, OOM risk | App crash imminent
+09:16:10 | Windows | IIS restart fails due DB unavailable | Reporting service remains down
+09:16:15 | App | Health check fails with HTTP 503 | App service degraded
+09:16:18 | DB | WAL archive lag 847ms | DB archival downstream impact
+09:16:22 | App | 89% transactions failing, 47 queued | Payment outage severe
+09:16:30 | Storage | throughput stalled at 0.2 MB/s | Storage bottleneck
+09:16:35 | Network | 156 denied flows from `10.0.1.10`→`10.0.2.10:5432` | Network-level block confirmed
+09:16:40 | DB | PostgreSQL service degraded, accepting no new connections | DB effectively unavailable
+09:16:44 | Windows | IIS worker crash from DB connection refused | Reporting service crash confirmed
+09:16:50 | App | JVM OOM imminent with 97% heap | App collapse imminent
+09:17:01 | App | Payment service crashes from OOM | Payment service fully down
+09:17:03 | App | Repeated HTTP 503s | Full outage confirmed
+09:17:08 | DB | Repeated max-connections alerts | DB still saturated
+09:17:12 | App | Restart loop begins | App restart attempts fail
+09:17:14 | App | Restart failed; DB unreachable | Recovery attempts blocked
+09:17:30 | App | Second restart attempt | Continued outage
+09:18:00 | Network | 312 cumulative denies logged | Network block persists
+
+---
+
+1. TOTAL TIME  
+- `1 minute 58 seconds` from the root cause event at `09:14:03` to the first CRITICAL alert at `09:16:01`.
+
+2. POINT OF NO RETURN  
+- `09:16:01` — `ALT-031` Payment transaction `TX-44821` failed with a confirmed customer impact.
+
+3. MISSING ALERT  
+- Azure Monitor alert rule:
+  - Signal type: `Azure Activity Log`
+  - Condition: `Update` operation on Network Security Group `nsg-app` security rule `AllowPostgres` where `sourceAddressPrefix` or `priority` changes
+  - Threshold: Greater than `0` matching change events
+  - Evaluation period: `5 minutes`
+  - Severity: `Sev 2`
+
+4. BLAST RADIUS at peak impact (09:17:00)
+- Services fully down:
+  - Payment service on `vm-app`
+  - IIS reporting service on `vm-win`
+- Services degraded:
+  - PostgreSQL on `vm-db` (no new connections accepted)
+  - Azure Storage WAL archiving and throughput
+  - App retry/memory subsystem
+  - Network path from app to DB
+- Estimated transactions failed:
+  - ~`2,400` transactions in one minute at peak 100% failure
+- Estimated revenue impact:
+  - ~`$2,400` lost in the peak minute
+
+5. CONTRADICTIONS
+- `ALT-001` shows the `AllowPostgres` source scope was widened, which would normally increase access rather than block it; this contradicts a simple deny-by-change hypothesis and suggests the incident may instead involve rule order or an unintended policy side effect.
+- `ALT-014` shows only 8/20 DB connections at 09:15:02, which is not yet exhaustion; it suggests rising DB load rather than an immediate max-connection failure.
+- `ALT-005` shows a healthy app at 09:14:09, indicating the failure was initiated after the NSG change rather than by an existing application fault.
+------------------------------------------------------------
+
+You are a senior Java/Linux performance engineer on Azure Ubuntu 22.04.
+
+Analyse these application server alerts from the FinBridge incident.
+The payment service runs Java 11 with -Xmx6g on Standard_B2ms (2 vCPU, 8GB RAM).
+
+ALT-017: 09:15:15 vm-app CPU-Elevated — cpu 42%, java PID 18821 consuming 38%, retry storm pattern
+ALT-020: 09:15:22 vm-app AppMemory — JVM heap 78%, GC overhead 18%, connection retry storm pattern
+ALT-022: 09:15:31 vm-app AppConnTimeout — [x8] DB connection timeout 10.0.2.10:5432 unreachable
+ALT-034: 09:16:05 vm-app CPU-Critical — cpu 94%, java PID 18821, connection retry + GC loop
+ALT-035: 09:16:08 vm-app AppMemory — JVM heap 91%, GC overhead 34%, OOM risk in <5 minutes
+ALT-044: 09:16:50 vm-app AppMemory-OOM — heap 97%, GC overhead 52%, full GC every 800ms
+ALT-045: 09:17:01 vm-app Service-Crashed — OOM Java heap space, automatic restart initiated
+ALT-048: 09:17:12 vm-app AppRestartLoop — restart attempt 1/3, DB connection check pending
+ALT-049: 09:17:14 vm-app AppRestartFailed — restart FAILED, cannot establish DB connection
+
+Answer ALL of the following:
+
+1. At what timestamp did the CPU pattern indicate a retry storm rather than genuine load?
+   What specific combination of metrics confirms it?
+
+2. What would ps aux output look like at 09:16:05 (ALT-034)?
+   Write the exact output you would expect to see for PID 18821.
+
+3. ALT-044 shows GC overhead at 52%. What is happening to payment transactions
+   that are currently in the JVM at this point?
+   Specifically: are they completing, failing, or suspended?
+
+4. ALT-049 shows the service restart FAILED even after the OOM crash cleared.
+   Explain exactly why a JVM restart does not solve this problem.
+
+5. At 09:16:00 — before the OOM — what is the CORRECT action for the Compute engineer?
+   Give three options in order of preference, with the reason each is better or worse
+   than restarting the JVM.
+
+6. What JVM flag would you add to the startup command to automatically capture
+   a heap dump before the OOM crash? Write the exact flag.
+
+7. Based on the GC overhead progression (18% → 34% → 52%), at approximately
+   what time would the JVM have crashed even without the OOM if load continued?
+   Show your calculation.
+
+
+----
+Creating a short TODO list to track analysis steps and answers I'll produce next.
+
+Created 6 todos
+
+Progress: TODO list created and first analysis step started. Now answering your questions.
+
+1) Timestamp and confirmation that pattern = retry storm  
+- Timestamp: 09:15:15 (ALT-017).  
+- Why: moderate host CPU (42%) with a single Java process using ~38% while other indicators show connection failures and client retries starting soon after (ALT-022 at 09:15:31). The specific confirming combination: elevated CPU concentrated in the Java process + rising JVM heap and GC activity (ALT-020 at 09:15:22: heap 78%, GC overhead 18%) + repeated DB connection timeouts (starting 09:15:31). That mix (process-local CPU + GC increase + DB timeouts) is the signature of a retry loop (threads spinning/waiting + frequent reconnect attempts) rather than sustained legitimate workload.
+
+2) Expected `ps aux` output for PID 18821 at 09:16:05 (ALT-034)  
+One representative `ps aux` line you would expect (values approximated from alerts and 2 vCPU / 8GB host; format: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND):
+
+labadmin 18821 92.0 69.0 6200000 5600000 ? Sl 09:10 01:23:45 java -Xmx6g -jar /opt/payment/payment-service.jar --spring.profiles=prod
+
+(Notes: `%CPU` shows the process using the majority of CPU (vm 94% total), `%MEM` reflects ~5.5GB resident of 8GB, VSZ/RSS in KB approximate the 6GB heap. Command text is an example; PID and resource numbers match the alert magnitudes.)
+
+3) With GC overhead at 52% (ALT-044), what are in-flight transactions doing?  
+- They are effectively suspended (not making forward progress). Threads are blocked in GC pauses or continually attempting work while the JVM spends the majority of time in GC; as a result most transactions are timing out or failing at the application layer. A small fraction already in native I/O or DB calls may complete, but the majority are stalled and then fail with timeouts (observed as 503s / failed payments).
+
+4) Why JVM restart does NOT solve the problem (ALT-049)  
+- The crash fixed memory usage temporarily, but the underlying external failure (DB connectivity exhaustion/unreachability or network-level DENY) remains. On restart the app immediately attempts DB connections and encounters the same rejection/unreachability (max_connections reached or NSG deny), causing the same retry storm and heap growth again. In short: restart is a symptom-focused action; the root cause is external (DB/network) so restarting just re-exposes the JVM to the same failing resource and leads to restart failure.
+
+5) Correct action at 09:16:00 (before OOM) — three options in order of preference
+- Option A (best): Restore DB connectivity / fix the network rule (rollback NSG change or unblock app→db). Why: addresses the root cause so retries stop, DB accepts connections, backlog drains; avoids OOM entirely. Better than restarting because it removes the source of the retry loop.
+- Option B (immediate protective stop): Gracefully stop the JVM/service to prevent further heap growth: `sudo systemctl stop payment-service` (or `kill -SIGTERM 18821` if systemd not used). Why: prevents additional allocations from retry loops and GC thrash, buys time to remediate DB connectivity. Better than restart because restart would re-initiate connection attempts; stopping prevents repeated failure cycles.
+- Option C (throttle/blackhole traffic): Temporarily block incoming customer traffic to the host or drop outbound DB connection attempts (e.g., `sudo iptables -A OUTPUT -d 10.0.2.10 -j DROP` or block frontend LB routing to this instance). Why: reduces request load and prevents further queuing and heap growth. Worse than Option B because it is blunt and may not stop internal reconnection loops; worse than fixing the network because it does not restore functionality.
+
+6) JVM flag to capture heap dump on OOM (exact flag)  
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/heapdumps/heapdump-%p.hprof
+
+7) Crash-time estimate from GC overhead progression (calculation)
+- Observed points:
+  - 09:15:22 → GC overhead = 18%
+  - 09:16:08 → GC overhead = 34% (delta +16% over 46 s) ≈ 0.3478 %/s
+  - 09:16:08 → 09:16:50 → GC overhead = 52% (delta +18% over 42 s) ≈ 0.4286 %/s
+- Use the recent (more aggressive) rate 0.4286 %/s to extrapolate to 100% GC overhead:
+  - Remaining % to 100% from 09:16:50 = 48%
+  - Time = 48 / 0.4286 ≈ 112 seconds ≈ 1 minute 52 seconds
+  - Predicted crash time ≈ 09:16:50 + 00:01:52 ≈ 09:18:42
+- Using the slightly earlier rate from 09:16:08 (0.3478 %/s) gives a slower estimate (~3m10s) and would predict ~09:19:18.  
+- Conclusion: linear extrapolation predicts a crash ~09:18:30–09:19:20 if nothing else changed; in reality the JVM crashed sooner at 09:17:01 because OOM conditions are not strictly linear and retries plus allocation spikes accelerated failure.
+
+If you want, I can:
+- produce exact `systemctl` and `az` command snippets to stop/restart the service or temporarily rollback the NSG rule;
+- generate a recommended emergency runbook with one-line commands and checks for the on-call engineer. Which would you like next?
+
+---------------------------------------------------------------------------
+You are a senior Azure network engineer.
+
+Analyse these network alerts from the FinBridge incident.
+
+ALT-001: 09:14:03 nsg-app NSG-RuleChanged — AllowPostgres rule modified.
+         Old source: 10.0.1.0/24. New source: 10.0.0.0/16. Priority changed from 100 to 50.
+         Changed by: network-admin@finbridge.internal
+ALT-002: 09:14:03 nsg-app NSG-FlowLogAnomaly — Rule priority changed from 100 to 50. Source scope widened.
+ALT-003: 09:14:05 vnet-ailab VNet-TopologyChange — Affected subnets: snet-app, snet-db.
+ALT-006: 09:14:12 pip-bastion Bastion-ConnLog — Admin session: network-admin@finbridge.internal.
+         Duration: 2m14s. Action: NSG modification.
+ALT-007: 09:14:47 vm-app AppConnTimeout — DB connection timed out 3000ms. 10.0.2.10:5432. Retry 1/3.
+ALT-041: 09:16:35 nsg-app NSG-FlowDenied — [x156] DENY 10.0.1.10 → 10.0.2.10:5432. DenyAllInbound (default).
+ALT-052: 09:18:00 nsg-app NSG-FlowDenied — [x312 cumulative] DENY 10.0.1.10 → 10.0.2.10:5432.
+
+Answer ALL of the following:
+
+1. The AllowPostgres source range was WIDENED from /24 to /16, yet traffic was BLOCKED.
+   Explain exactly why widening a source range caused connectivity to fail.
+   Walk through the NSG rule evaluation order step by step.
+
+2. ALT-001 shows priority changed from 100 to 50.
+   In Azure NSG, which priority number takes precedence — lower or higher?
+   What other rule must exist in this NSG to explain why lower priority (50)
+   causes traffic to be blocked by DenyAllInbound (priority 65000)?
+
+3. Write the EXACT Azure CLI command to:
+   a) Show all effective NSG rules on vm-app's NIC right now
+   b) Fix the AllowPostgres rule to restore connectivity
+   c) Verify the fix is working (within 30 seconds of applying it)
+
+4. The gap between the NSG change (09:14:03) and the first DENY flow log (09:16:35)
+   is 1 minute 32 seconds. Why do NSG flow logs not appear immediately?
+   What does this gap mean for incident response timing?
+
+5. Write the Azure Monitor alert rule that would have detected this change
+   BEFORE it caused any impact. Include:
+   - Signal: Activity Log
+   - Operation name (exact Azure operation string)
+   - Severity: Warning
+   - What the alert notification should include (before/after state)
+
+6. What change management process gap does ALT-006 (Bastion connection log) reveal?
+   The admin was connected for 2m14s. Is that enough time to validate a network change?
+
+-----
+Completed: *Network NSG analysis* (1/4)
+
+Preamble: Updating the todo list and now presenting the NSG analysis and exact remediation commands.
+
+1) Why widening the source range caused a block — step-by-step
+- NSG evaluation model (key fact): rules evaluated in ascending numeric priority; the first rule that matches (direction, source, destination, protocol, ports) is applied; if no rule matches, the default action is DenyAllInbound (priority 65000).
+- What happened (using only alert data): ALT-001 shows the `AllowPostgres` rule was modified (source -> 10.0.0.0/16, priority 50). ALT-041/ALT-052 show subsequent DENY entries logged by the default `DenyAllInbound`. That means traffic from 10.0.1.10 → 10.0.2.10:5432 did not match any Allow rule after the change, so the default deny applied.
+- How widening the source can produce that effect (exact reasoning, no assumptions beyond alerts):
+  1. Prior state: `AllowPostgres` (priority 100, source 10.0.1.0/24) matched flows from 10.0.1.10 and allowed them before the default deny applied.
+  2. Change applied: `AllowPostgres` now has source 10.0.0.0/16 and priority 50. NSG engine re-evaluates rules top-to-bottom by priority.
+  3. After the edit, the altered rule no longer matched the actual packets from the host (alerts show DENY), so no Allow rule matched and the default `DenyAllInbound` rule (implicit) was the effective action.
+- Two concrete ways the edited rule can stop matching (consistent with alerts):
+  - The edit accidentally changed a matching attribute (for example, direction, destination port, or the exact field name) so packets from 10.0.1.10 no longer matched the modified Allow rule — therefore default Deny applied.
+  - Or a separate higher-precedence Deny rule exists (see Q2) that now matches the traffic before any Allow, so the Allow is never reached.
+- Bottom line: widening a source range does not by itself cause a block — but the edit plus the new priority changed rule-evaluation semantics such that no Allow matched the traffic and the default Deny took effect (as proven by ALT-041 / ALT-052 DENY logs).
+
+2) Priority semantics and what other rule must exist
+- Priority rule: lower numeric priority value takes precedence (priority 100 is evaluated after 50; 50 is evaluated before 100).
+- To explain why traffic was ultimately blocked by `DenyAllInbound` (priority 65000) despite `AllowPostgres` being moved to priority 50, one of two possibilities (both consistent with alerts) must be true:
+  - The edited `AllowPostgres` no longer matched the actual packet attributes (most likely), so no Allow rule matched and default Deny applied — no extra rule required.
+  - Or there exists a higher-precedence Deny rule (i.e., a rule with numeric priority <50) that explicitly denies the same flow. If that were present, it would take effect before the Allow at 50. So the other rule that could explain blocking would be a Deny rule with priority <50 targeting 10.0.1.0/24 or the relevant destination/port.
+- Given the DENY entries are attributed to `DenyAllInbound` (the implicit default rule), the alert evidence points stronger to "the Allow no longer matched" rather than a new explicit deny rule with priority <50.
+
+3) Exact Azure CLI commands
+- Preamble: these commands list NSG rules and NIC association, update the rule, and verify connectivity from the VM via run-command (works through Bastion / az run-command).
+
+a) Show NSG rules and NIC association (effective information):
+```bash
+# List NSG rules for nsg-app
+az network nsg rule list --resource-group rg-ailab-arunkumar --nsg-name nsg-app -o table
+
+# Show NIC's attached NSG (which NSG is applied to the vm-app NIC)
+az network nic show --resource-group rg-ailab-arunkumar --name nic-app --query "networkSecurityGroup" -o json
+```
+
+b) Fix the `AllowPostgres` rule to restore connectivity (set source back to 10.0.1.0/24 and ensure it allows TCP/5432 inbound at a safe priority):
+```bash
+az network nsg rule update \
+  --resource-group rg-ailab-arunkumar \
+  --nsg-name nsg-app \
+  --name AllowPostgres \
+  --priority 100 \
+  --access Allow \
+  --direction Inbound \
+  --protocol Tcp \
+  --destination-port-ranges 5432 \
+  --source-address-prefixes 10.0.1.0/24
+```
+
+c) Verify the fix (within ~30s) by testing connectivity from `vm-app` to `vm-db` using `az vm run-command invoke`:
+```bash
+az vm run-command invoke -g rg-ailab-arunkumar -n vm-app --command-id RunShellScript --scripts \
+"bash -c 'timeout 3 bash -c \"</dev/tcp/10.0.2.10/5432\" >/dev/null 2>&1 && echo CONNECTED || echo BLOCKED'"
+```
+- Expected output: `CONNECTED` (if fix worked), otherwise `BLOCKED`.
+
+4) Why flow logs appear with delay (1m32s gap) and what it means for incident response
+- NSG flow logs are produced by Network Watcher and are batched/aggregated and delivered asynchronously (they are not a synchronous packet drop trace). Typical causes of the observed delay:
+  - Flow logs are collected, buffered and written at intervals (depends on diagnostic settings and ingestion latency).
+  - Logging and pipeline ingestion to storage/monitoring have collection and export latency (often tens of seconds to minutes).
+- What the 1:32 gap means:
+  - The actual blocking (or the rule-change effect) occurred earlier — the edit at 09:14:03 — but the flow-log evidence (visible DENY entries) only appeared at 09:16:35 due to collection latency.
+  - For responders: do not wait for flow logs to appear to act; use activity log (audit) events, NIC/NSG rule listing, and immediate connectivity tests from the host to validate impact. Treat flow logs as confirmatory, not as the first indicator.
+
+5) Azure Monitor activity-log alert rule to detect the NSG rule change BEFORE impact
+- Signal: Activity Log
+- Operation name (exact Azure operation string): Microsoft.Network/networkSecurityGroups/securityRules/write
+- Severity: Warning
+- Condition: Trigger when an Activity Log "Write" operation is performed on any `securityRules` under the NSG resource `nsg-app` (or any NSG) where properties include a changed `sourceAddressPrefix` or changed `priority`.
+- Example alert rule JSON (concise form showing the intent — include old/new in notification):
+```json
+{
+  "name": "Detect-NSG-Rule-Changes-AllowPostgres",
+  "description": "Alert when a security rule on NSG 'nsg-app' is created/updated",
+  "condition": {
+    "signalName": "ActivityLog",
+    "operationName": "Microsoft.Network/networkSecurityGroups/securityRules/write",
+    "filters": [
+      { "field": "resourceGroup", "operator": "Equals", "value": "rg-ailab-arunkumar" },
+      { "field": "resourceId", "operator": "Contains", "value": "/networkSecurityGroups/nsg-app" }
+    ]
+  },
+  "severity": "Warning",
+  "action": {
+    "email": ["netops@finbridge.internal"]
+  },
+  "notificationPayload": {
+    "include": ["claims","correlationId","eventTimestamp","operationName","authorization","properties.previousValue","properties.newValue"]
+  }
+}
+```
+- Notification contents (must include): the Activity Log event, who made the change (`caller`: network-admin@finbridge.internal), timestamp, and properties `before`/`after` showing `sourceAddressPrefix` and `priority` old and new values.
+
+6) Change management gap revealed by ALT-006 (Bastion connection)
+- What the alert shows: an admin session via Bastion for 2m14s and the action: NSG modification.
+- Gaps identified:
+  - No staged/peer-reviewed change: the change appears to have been made directly from Bastion during an interactive session, with no pre-deployment validation documented in alerts.
+  - No change-window/notification or automated safety checks: there is no evidence of a dry-run, effective-rule validation, or instant connectivity test being run as part of the change.
+  - Insufficient immediate verification: 2m14s is typically insufficient to validate a network-wide rule change end-to-end (should include automated connectivity checks, service smoke-tests, and monitoring alerts). The time window suggests the change was made and the admin session ended quickly without confirming effective allow on the data-plane.
+- Recommendation summary: require change approvals, automated pre/post change connectivity tests, and a rollback script; mandate that NSG writes are performed via CI/CD with preflight checks rather than interactive Bastion edits.
+
+If you want, I can:
+- produce a one-line rollback command to revert the exact change (based on ALT-001 values) and a short verification script to run via `az vm run-command` from Cloud Shell; or
+- create the Activity Log alert in ARM JSON or an `az monitor` create command. Which next?
+
+------------------------------------------
+DB Tower deep dive
+---
+You are a senior PostgreSQL DBA on Ubuntu 22.04.
+
+Analyse these database alerts from the FinBridge incident.
+PostgreSQL 14, max_connections=20, on Standard_B2ms (2 vCPU, 8GB RAM).
+
+ALT-004: 09:14:08 vm-db DB-ConnMonitor — baseline: 3/20 connections. Threshold: 16/20.
+ALT-010: 09:14:52 vm-db PG-ConnDrop — unexpected drop from 10.0.1.10 without clean close. PID 12341.
+ALT-011: 09:14:54 vm-db PG-ConnDrop — unexpected drop from 10.0.1.10 without clean close. PID 12342.
+ALT-014: 09:15:02 vm-db PG-ConnCount — 8/20 active. 6 connections in 'idle in transaction' > 30 seconds.
+ALT-016: 09:15:12 vm-db PG-SlowQuery — 8432ms. SELECT c.name COUNT(o.id) FROM customers JOIN orders. PID 12344.
+ALT-021: 09:15:28 vm-db PG-LockWait — PID 12346 waiting for ShareLock held by PID 12341. Wait: 28s.
+ALT-023: 09:15:35 vm-db PG-ConnCount — 16/20. ALERT THRESHOLD REACHED.
+ALT-025: 09:15:44 vm-db PG-Deadlock — deadlock between PID 12341 and 12342. Both waiting ShareLock. Rolled back.
+ALT-027: 09:15:50 vm-db PG-ConnCount — 18/20. 2 connections remaining.
+ALT-030: 09:16:01 vm-db PG-ConnExhausted — FATAL: sorry, too many clients already. New connections REFUSED.
+ALT-038: 09:16:18 vm-db PG-WALLag — WAL archive lag: 847ms (normal: <100ms).
+ALT-042: 09:16:40 vm-db PG-ServiceDegraded — accepting no new connections. 47 transactions queued.
+ALT-047: 09:17:08 vm-db PG-ConnExhausted — [x67 repetitions] FATAL: sorry, too many clients already.
+
+Answer ALL of the following:
+
+1. Reconstruct the connection count progression from the alerts with timestamps.
+   Calculate the connection accumulation rate in connections per minute.
+
+2. At ALT-010 and ALT-011, vm-app dropped TCP connections to PostgreSQL without
+   a clean close. What state are PID 12341 and 12342 in immediately after this?
+   Specifically: do they still hold row locks? Write the SQL to check.
+
+3. ALT-014 shows 6 connections 'idle in transaction' for >30 seconds.
+   These connections were holding locks (confirmed by ALT-021).
+   How many of the 20 max_connections were doing USEFUL work at peak?
+   Show your working.
+
+4. The deadlock at ALT-025 (09:15:44) involves PID 12341 and PID 12342.
+   These are the same PIDs that dropped connections at ALT-010 and ALT-011.
+   Explain how a dropped connection causes a deadlock on reconnect.
+
+5. Write the exact SQL to terminate all idle-in-transaction connections
+   that have been idle for more than 5 minutes. This is the fastest safe
+   remediation once the NSG is fixed. Do NOT terminate active queries.
+
+6. ALT-038 shows WAL archive lag at 847ms at 09:16:18.
+   Classify this as: PRIMARY problem / SECONDARY symptom / UNRELATED.
+   Explain your reasoning and what the lag indicates about PostgreSQL's
+   internal worker processes during a connection storm.
+
+7. With max_connections=20 and this incident pattern, what is the minimum
+   PgBouncer configuration that would have prevented connection exhaustion?
+   Write the exact pgbouncer.ini settings.
+
+---
+Comprehensive analysis of the PostgreSQL incident using alert data only.
+
+1) **Connection count progression and accumulation rate**
+
+Extracting from alerts:
+
+| Timestamp | Alert   | Connections | Delta   | Time since prev |
+|-----------|---------|-------------|---------|-----------------|
+| 09:14:08  | ALT-004 | 3/20        | +3      | baseline        |
+| 09:15:02  | ALT-014 | 8/20        | +5      | 54 seconds      |
+| 09:15:35  | ALT-023 | 16/20       | +8      | 33 seconds      |
+| 09:15:50  | ALT-027 | 18/20       | +2      | 15 seconds      |
+| 09:16:01  | ALT-030 | 20/20       | +2      | 11 seconds      |
+
+**Accumulation rates:**
+- 09:14:08–09:15:02: 5 connections in 54 sec = **5.56 conn/min**
+- 09:15:02–09:15:35: 8 connections in 33 sec = **14.55 conn/min** (acceleration)
+- 09:15:35–09:15:50: 2 connections in 15 sec = **8.0 conn/min**
+- 09:15:50–09:16:01: 2 connections in 11 sec = **10.91 conn/min**
+- **Overall average**: 17 connections in 113 seconds = **9.03 conn/min**
+
+The increasing rate from 5.56 → 14.55 matches the app retry storm escalation (see ALT-017, ALT-020).
+
+---
+
+2) **State of PID 12341 and 12342 after unclean TCP disconnect**
+
+**Immediately after:**
+- Both PIDs are in a "dead" or "disconnected" backend state.
+- PostgreSQL detects the unclean close and marks the slot as abandoned.
+- **All row locks held by these PIDs are released** (PostgreSQL cleanup on disconnect).
+- The backend process may linger briefly until PostgreSQL reaps it, but it holds no locks.
+
+**SQL to confirm their state:**
+```sql
+SELECT pid, usename, application_name, state, state_change, query, pg_blocking_pids(pid)
+FROM pg_stat_activity
+WHERE pid IN (12341, 12342);
+```
+
+Expected result: `pid` entries for 12341/12342 would either be gone (cleaned up) or show state = 'disconnected' with empty `pg_blocking_pids(pid)`.
+
+---
+
+3) **How many connections were doing useful work at peak?**
+
+**At ALT-014 (09:15:02, 8/20 connections):**
+- 6 connections in 'idle in transaction' (>30s) — holding locks, not useful
+- 2 connections in other states (likely 1 active query + 1 idle-not-in-transaction)
+
+**At peak exhaustion (ALT-030, 09:16:01, 20/20 connections):**
+- The same 6 idle-in-transaction connections remain stuck (they never release)
+- Additional 12 connections added (from app retries)
+- From ALT-025: 2 of these 12 are in a deadlock (both waiting on ShareLock)
+- From ALT-021: at least 1 other is waiting for a lock held by the stuck 6
+
+**Calculation:**
+- Total: 20 connections
+- Idle-in-transaction (locked): 6
+- Waiting for locks (from deadlock/lock-wait): 3+
+- Active/useful: **0–1 connection** at peak
+
+The spike from 8 to 20 connections added 12 new retries, but none of them are doing useful work — they are all waiting or in failed retry states.
+
+---
+
+4) **How dropped connection causes deadlock on reconnect**
+
+**Chain of events (using alert data):**
+
+1. At 09:14:47 (ALT-007), `vm-app` first attempts DB connection to 10.0.2.10:5432 — times out (likely due to NSG rule change).
+2. At 09:14:52 (ALT-010) and 09:14:54 (ALT-011), PIDs 12341 and 12342 disconnect uncleanly from the client side (no COMMIT/ROLLBACK).
+3. At 09:15:28 (ALT-021), PID 12346 is waiting for a ShareLock held by PID 12341.
+4. At 09:15:44 (ALT-025), deadlock detected between PID 12341 and 12342, both waiting for ShareLock — rolled back.
+
+**Why the deadlock occurs after the drop:**
+- When the client drops uncleanly, the transaction on PID 12341/12342 is left in an uncommitted state (locks still held on the database until cleanup).
+- Cleanup is delayed or the connection slot persists.
+- When `vm-app` retries the same logical transaction, it reconnects and the backend tries to re-acquire locks.
+- If the app sends conflicting lock requests in different orders on the retry (e.g., lock A then B on one PID, lock B then A on another), a circular wait forms → deadlock.
+- PostgreSQL detects the cycle and rolls back one transaction, but the slot remains occupied (ALT-025).
+
+---
+
+5) **SQL to safely terminate idle-in-transaction connections**
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND state_change < NOW() - INTERVAL '5 minutes'
+  AND pid != pg_backend_pid();
+```
+
+**Safer version (only kill obvious hangers, not recent ones):**
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND (NOW() - state_change) > INTERVAL '30 seconds'
+  AND backend_type = 'client backend'
+  AND pid != pg_backend_pid();
+```
+
+**Why safe:** only terminates idle-in-transaction (not active queries), excludes the admin connection (`pg_backend_pid()`), and allows a grace period before killing.
+
+---
+
+6) **WAL archive lag classification**
+
+**Classification: SECONDARY SYMPTOM**
+
+**Reasoning:**
+- ALT-038 shows lag at 847ms (normal <100ms) at 09:16:18, well after the connection storm began (09:15:02).
+- The root cause is connection exhaustion and lock contention, not a WAL writer failure.
+- Lag occurs because:
+  - The WAL archiver background worker is starved of available database connections or resources.
+  - When 20/20 connections are occupied by stuck/waiting transactions, no archiver slots available.
+  - Transaction throughput is near zero due to deadlocks and lock waits (ALT-025, ALT-021), so very few WAL records are being generated and archived.
+- The lag is a downstream effect of the connection storm, not the cause.
+
+**What it indicates:** PostgreSQL's background processes (WAL archiver, autovacuum) are effectively paused or rate-limited by the connection crisis and lock contention.
+
+---
+
+7) **Minimum PgBouncer configuration to prevent exhaustion**
+
+PgBouncer acts as a connection pooler, multiplexing many client connections into fewer backend connections to PostgreSQL.
+
+**pgbouncer.ini:**
+```ini
+[databases]
+labdb = host=10.0.2.10 port=5432 dbname=labdb user=labuser password=Lab@2024!
+
+[pgbouncer]
+logfile = /var/log/pgbouncer/pgbouncer.log
+pidfile = /var/run/pgbouncer/pgbouncer.pid
+
+; Client-facing settings
+listen_addr = 0.0.0.0
+listen_port = 6432
+max_client_conn = 100
+
+; Backend pool settings (PostgreSQL connections)
+default_pool_size = 8
+min_pool_size = 4
+reserve_pool_size = 2
+reserve_pool_timeout = 3
+
+; Transaction pooling: release connection after each transaction (fastest safe mode)
+pool_mode = transaction
+
+; Connection reuse and cleanup
+connection_lifetime = 3600
+idle_in_transaction_session_timeout = 60000
+
+; TCP tuning
+tcp_keepalives = 1
+tcp_keepidles = 5
+tcp_keepintvls = 5
+```
+
+**Why this prevents exhaustion:**
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `max_client_conn` | 100 | PgBouncer accepts up to 100 client connections |
+| `default_pool_size` | 8 | But only maintains 8 actual PostgreSQL connections (vs 20 max) |
+| `min_pool_size` | 4 | Minimum 4 connections kept open, ready for use |
+| `reserve_pool_size` | 2 | Emergency 2 extra connections for spikes |
+| `pool_mode = transaction` | – | Release connection back to pool after each transaction (not after idle time) |
+
+**Result:** app can queue 100 client connections, but only 8–10 actual DB connections used, preventing exhaustion of the `max_connections=20` limit on PostgreSQL. Excess app connections wait in PgBouncer's queue briefly and are served as DB connections become available.
+
+---
+
+**If needed next, I can provide:**
+- A remediation sequence (kill idle-in-transaction → validate → monitor recovery)
+- PgBouncer systemd unit file and deployment steps for `vm-app`
+- Monitoring queries to detect future lock-wait and idle-in-transaction buildup
+
+
+------------------------------
+
+Storage Tower Deep-Dive
+---
+You are a senior storage and infrastructure engineer on Azure.
+
+Analyse these storage alerts from the FinBridge incident.
+
+ALT-012: 09:14:58 stailab Storage-WriteLatency — write latency: 48ms (normal: 4ms). Container: lab-data. 3 ops.
+ALT-024: 09:15:38 vm-app  DiskIOPS — disk IOPS: 840 (threshold: 500). Cause: high log write volume from error storm.
+ALT-028: 09:15:52 stailab Storage-IOLatency — I/O latency: 284ms (threshold: 20ms). DB WAL archive writes delayed.
+ALT-038: 09:16:18 vm-db   PG-WALLag — WAL archive lag: 847ms (normal: <100ms). WAL writer blocked.
+ALT-040: 09:16:30 stailab Storage-Throughput — throughput: 0.2 MB/s (normal: 4 MB/s). WAL archiving stalled.
+
+For each alert classify it as:
+  PRIMARY   — an independent storage problem requiring storage-level remediation
+  SECONDARY — triggered by the network/DB incident (noise in the context of this RCA)
+  UNKNOWN   — insufficient evidence to classify
+
+Then answer ALL of the following:
+
+1. Provide your classification for each alert with a one-sentence justification.
+
+2. ALT-024 shows disk IOPS at 840 on vm-app (threshold: 500).
+   This threshold is designed to detect disk-intensive workloads.
+   Is this threshold appropriate? What would you change it to, and why?
+
+3. At 09:16:30 (ALT-040), Azure Storage throughput dropped to 0.2 MB/s.
+   The storage account itself is healthy. What is preventing PostgreSQL from
+   writing WAL archives to storage? Trace the exact dependency chain.
+
+4. What action, if any, should the Storage engineer take during this incident?
+   Give a specific recommendation with justification.
+
+5. Write a composite alert rule that prevents storage noise alerts from firing
+   during application retry storms. Format:
+     Condition A: [storage metric]
+     Condition B: [application metric]
+     Logic: fire ONLY if A is true AND B is false
+     Rationale: why this combination avoids false positives
+
+6. After the incident is resolved, ALT-028 shows WAL archive lag reached 847ms.
+   This means some WAL files were not archived during the incident window.
+   Is there a data loss risk? What command confirms WAL archive integrity?
+
+------
+
+1. **Alert Classifications**
+
+| Alert   | Classification | Justification |
+|---------|---|---|
+| ALT-012 | SECONDARY | Write latency spike at 09:14:58 is an early manifestation of the incident cascade beginning (app connection timeouts started at 09:14:47), not an independent storage fault. |
+| ALT-024 | SECONDARY | 840 IOPS from error logs is a direct downstream effect of the app retry storm caused by the DB connectivity failure. |
+| ALT-028 | SECONDARY | Storage I/O latency is caused by PostgreSQL's write backlog due to connection exhaustion and lock contention, not a storage tier problem. |
+| ALT-038 | SECONDARY | WAL archive lag is a symptom of the DB incident (writer starved of available connections), not a storage infrastructure issue. |
+| ALT-040 | SECONDARY | Storage throughput stall is caused by PostgreSQL's WAL archiver background worker being unable to connect or schedule due to `max_connections` exhaustion; the storage account itself is healthy. |
+
+---
+
+2. **ALT-024 IOPS threshold appropriateness and recommendation**
+
+**Current threshold:** 500 IOPS  
+**Is it appropriate?** No — it fires during a transient error log spike, which is not indicative of a storage problem.
+
+**Why?**
+- Standard_B2ms disk performance is designed to handle sustained reads/writes well above 500 IOPS.
+- 840 IOPS is expected during an application incident with high-volume error logging.
+- The alert does not distinguish between healthy load and unhealthy load.
+
+**Recommended change:**
+Raise threshold to **2000–3000 IOPS** and add a correlation condition:
+```
+Alert fires if (IOPS > 2000) AND (error_rate > 20% OR connection_timeouts > 10/min)
+```
+
+**Rationale:** This eliminates noise from transient retries and only alerts when disk stress correlates with a genuine application problem that requires storage-level intervention (e.g., query plan explosion, checkpoint storm).
+
+---
+
+3. **Dependency chain blocking WAL archive writes at 09:16:30**
+
+**Trace from root cause to storage impact:**
+
+1. **09:14:03** — NSG rule change blocks `10.0.1.10` → `10.0.2.10:5432` (confirmed by ALT-041/ALT-052 DENY logs)
+2. **09:14:47** — `vm-app` detects DB unreachable, enters retry loop
+3. **09:15:02–09:16:01** — Each retry consumes a new connection slot; `max_connections=20` reached
+4. **09:16:01** — PostgreSQL refuses new connections: `FATAL: sorry, too many clients already`
+5. **09:16:18** (ALT-038) — PostgreSQL WAL writer background worker cannot obtain a connection slot to archive WAL
+   - OR: WAL writer is blocked waiting for locks held by idle-in-transaction connections (ALT-014: 6 connections idle-in-transaction for >30s)
+6. **09:16:30** (ALT-040) — WAL files accumulate in `pg_wal/` directory locally, but cannot be shipped to Azure Storage
+7. **Result:** Throughput to storage drops to 0.2 MB/s (only metadata operations, no WAL writes)
+
+**Chain summary:**
+```
+NSG Block (09:14:03)
+  ↓
+App Retry Storm (09:14:47+)
+  ↓
+Connection Pool Exhaustion (09:16:01)
+  ↓
+WAL Archiver Starved / Blocked (09:16:18)
+  ↓
+Storage Throughput Stalled (09:16:30)
+```
+
+---
+
+4. **Action for Storage Engineer**
+
+**Recommendation:** No storage-level remediation is required or appropriate.
+
+**Justification:**
+- ALT-040 explicitly states the storage account is healthy.
+- The throughput drop is not due to storage tier failure, throttling, or capacity issues.
+- The root cause is external (DB connection exhaustion).
+
+**What the Storage engineer SHOULD do:**
+1. Confirm Azure Storage metrics (capacity, latency, error rate) are within normal baseline — document this for the RCA.
+2. Verify no capacity limits or throttling rules are active on the storage account.
+3. Set an expectation that WAL throughput will recover to normal (4 MB/s) only after the DB incident is resolved.
+4. Plan a post-incident review of WAL archive lag thresholds to set realistic alerting (currently too sensitive during transient DB incidents).
+
+**Escalation:** Alert the DB and Network teams that storage is healthy; the incident is in their domain.
+
+---
+
+5. **Composite alert to prevent storage noise during app retry storms**
+
+```
+Alert name: Storage-Issue-Independent
+
+Condition A (Storage signal):
+  Metric: Azure Storage I/O Latency
+  Operator: >
+  Threshold: 100 ms
+  OR
+  Metric: Azure Storage Throughput
+  Operator: <
+  Threshold: 1.0 MB/s
+
+Condition B (Application signal):
+  Metric: App Error Rate
+  Operator: <
+  Threshold: 10%
+  AND
+  Metric: App Health Check
+  Operator: ==
+  Value: "Passing"
+
+Logic:
+  Fire alert IF (Condition A) AND (Condition B)
+
+Evaluation period: 2 minutes
+
+Severity: Warning
+```
+
+**Rationale:**
+- If storage is degraded **AND** the app is healthy → independent storage problem requiring storage-engineer action.
+- If storage is degraded **BUT** the app is failing → secondary effect of an application incident; suppress this alert and only fire app-layer alerts.
+- This prevents false positives during transient app incidents and focuses the on-call engineer on the correct domain (app/DB, not storage).
+
+---
+
+6. **Data loss risk and WAL archive integrity check**
+
+**Data loss risk assessment:** MINIMAL if PostgreSQL cleanly shuts down or recovers.
+- WAL lag means files are not yet archived to cloud storage, but they are safely stored locally in `pg_wal/` directory on the VM disk.
+- PostgreSQL will eventually archive the backlog once the incident clears (app reconnects, connection pool normalizes, archiver worker resumes).
+- Data loss occurs only if the VM crashes hard before WAL is replayed during recovery.
+
+**Commands to confirm WAL integrity:**
+
+```bash
+# On vm-db, check for unarchived WAL files (as postgres user):
+sudo -u postgres psql -c "SELECT pg_current_wal_lsn(), pg_current_wal_insert_lsn();"
+
+# Check archive status directory for pending files:
+sudo ls -la /var/lib/postgresql/14/main/pg_wal/archive_status/ | grep "\.ready" | wc -l
+
+# If any .ready files exist without corresponding .done, those WAL files are waiting to be archived.
+
+# Monitor archiver progress:
+sudo -u postgres psql -c "SELECT now(), last_archive_wal, last_wal_timex, failed_count FROM pg_stat_archiver;"
+
+# Check the most recent archived WAL timestamp:
+sudo -u postgres psql -c "SELECT max(backup_tstmp) FROM pg_stat_archiver;"
+```
+
+**Expected post-recovery result:**
+- All `.ready` files should clear and become `.done` within seconds to minutes after the incident resolves.
+- `pg_stat_archiver.last_archive_wal` timestamp should advance to current time.
+- If these recover, no data loss occurred.
+
+Prompt for Alert Suppression Rules
+---
+You are a senior monitoring engineer.
+
+Based on the FinBridge incident analysis, design alert suppression rules
+that would reduce the 280-alert storm to the 10-15 alerts that actually matter.
+
+Root cause confirmed: NSG rule change blocked DB connectivity at 09:14:03.
+
+Primary alerts that must ALWAYS fire (never suppress):
+  - NSG rule modification (ALT-001)
+  - First DB connection failure from app (ALT-007)
+  - PostgreSQL connection exhaustion (ALT-030)
+  - Payment service crash (ALT-045)
+
+Secondary alerts confirmed as noise:
+  - ALT-024: DiskIOPS on vm-app
+  - ALT-028: Storage-IOLatency
+  - ALT-038: PG-WALLag
+  - ALT-040: Storage-Throughput
+  - ALT-033, ALT-047: Repeated PG-ConnExhausted (67 repetitions)
+  - ALT-032, ALT-046: Repeated AppPaymentFailed / HealthCheck-Failed
+
+For EACH suppression rule you design, provide:
+
+  Rule name:
+  Trigger condition: (what must be TRUE to activate suppression)
+  Suppressed alerts: (exact alert names silenced)
+  Duration: (how long suppression stays active)
+  Auto-close condition: (what resolves the suppression automatically)
+  Risk: (what real problem could this rule accidentally hide?)
+  Mitigation: (how to reduce that risk)
+
+After all rules, provide:
+
+  BEFORE vs AFTER COUNT:
+    CRITICAL before: 47    CRITICAL after: ____
+    WARNING before:  138   WARNING after:  ____
+    INFO before:     95    INFO after:     ____
+    TOTAL before:    280   TOTAL after:    ____
+
+  GAP ANALYSIS: What alert is still MISSING from this environment
+  that would have detected the root cause BEFORE the first symptom?
+  Write the exact Azure Monitor Activity Log alert rule definition.
+
+Constraints:
+  - No suppression rule may silence an alert from a different resource type
+    than the one triggering it (don't let a DB alert suppress a storage alert)
+  - All rules must auto-expire — no permanent suppressions
+  - Each rule must have a named owner (which tower is responsible for it)
+
+---
+
+Creating a TODO list to track suppression-rule design, counts, and RCA follow-ups.
+
+Created 4 todos
+
+Progress: TODO list created and suppression-rule design started. Below are the suppression rules and requested summaries.
+
+Rule name: NSG-Change-Flow-Deny-Suppression  
+Trigger condition: `nsg-app` has Activity Log event `Microsoft.Network/networkSecurityGroups/securityRules/write` (NSG-RuleChanged) within last 2 minutes.  
+Suppressed alerts: `NSG-FlowDenied` (repeated DENY flow log alerts on `nsg-app`) and `NSG-FlowLogAnomaly` duplicates (ALT-041, ALT-052, ALT-002).  
+Duration: 30 minutes (auto-expire).  
+Auto-close condition: suppression clears immediately if a new Activity Log event reverts the security rule (securityRules/write restoring previous values) OR when `NSG-FlowDenied` rate falls below 5/min for 2 consecutive minutes.  
+Risk: could hide a persistent, emergent network block caused by another change.  
+Mitigation: always allow the initial `NSG-FlowDenied` alert to be forwarded (first occurrence within window not suppressed); require pager for any CRITICAL `NSG-FlowDenied` count >500 in 5 minutes; include sampled flow logs in suppression notification.  
+Owner: Network Tower
+
+Rule name: DB-ConnExhausted-Dedupe  
+Trigger condition: first `PG-ConnExhausted` critical on `vm-db` within 5 minutes.  
+Suppressed alerts: repeated `PG-ConnExhausted` alerts (ALT-033, ALT-047 repetitions) and repeated `PG-ConnCount` high-watermark warnings within the same incident window.  
+Duration: 20 minutes (auto-expire).  
+Auto-close condition: suppression clears when `pg_stat_activity` shows `active connections < (max_connections - 2)` for 2 consecutive minutes or when `PG-ServiceDegraded` clears.  
+Risk: may hide a continuing DB capacity issue that is worsening (e.g., new independent failure causing repeated exhaustion).  
+Mitigation: retain and escalate the first critical `PG-ConnExhausted` immediately (no suppression), send aggregated summary metrics to DB on-call every 5 minutes, and require an enforced paging threshold if `PG-ConnExhausted` persists beyond 20 minutes.  
+Owner: DBA Tower
+
+Rule name: App-Failure-Storm-Suppression (vm-app)  
+Trigger condition: `vm-app` `AppPaymentFailed` OR `HealthCheck-Failed` critical fired within last 3 minutes.  
+Suppressed alerts: repeated `AppPaymentFailed` / `HealthCheck-Failed` duplicates, `AppErrorRate` repeated warnings, `AppConnTimeout` flood alerts, and `DiskIOPS` alerts for `vm-app` (ALT-032, ALT-046, ALT-013, ALT-022, ALT-024).  
+Duration: 25 minutes (auto-expire).  
+Auto-close condition: suppression clears when `vm-app` health check returns HTTP 200 for 2 consecutive checks OR when `AppPaymentFailed` rate drops below 1% for 5 minutes.  
+Risk: could hide a separate application fault unrelated to DB (e.g., code-level bug causing failures independent of DB).  
+Mitigation: never suppress the first occurrence of `AppPaymentFailed` (it always pages); sample and store the next 3 stacktraces/log snippets for triage; require the App tower to run an automated smoke test prior to marking incident resolved.  
+Owner: App Tower
+
+Rule name: Storage-Transient-Lag-Suppression (stailab)  
+Trigger condition: `stailab` `Storage-IOLatency` OR `Storage-WriteLatency` firing AND `stailab` platform health state = Available (i.e., storage account backend shows healthy).  
+Suppressed alerts: repeated `Storage-Throughput`, repeated `Storage-IOLatency`, repeated `Storage-WriteLatency` duplicates (ALT-040, ALT-028, ALT-012).  
+Duration: 30 minutes (auto-expire).  
+Auto-close condition: suppression clears when storage account platform health != Available OR when storage I/O metrics return to baseline (latency < 50ms and throughput > 2 MB/s) for 2 consecutive minutes.  
+Risk: could hide a true primary storage outage (hardware or Azure service degradation).  
+Mitigation: require storage platform health check; if storage `Availability` metric falls, suppress rule does NOT activate; send one immediate consolidated notification to Storage on first trigger (so engineers can confirm whether storage or upstream system is at fault).  
+Owner: Storage Tower
+
+Rule name: App-Alert-Dedupe-Per-Host (vm-app info/warn dedupe)  
+Trigger condition: Any `vm-app` alert repeating more than 10 times in 5 minutes.  
+Suppressed alerts: further duplicates of the same alert name (INFO/WARN) for the same host, aggregated into a single rolling summary alert every 5 minutes.  
+Duration: 15 minutes (auto-expire).  
+Auto-close condition: suppression clears when repeat rate < 1/min for 5 minutes.  
+Risk: may hide the growth trend of some metrics if only aggregating;  
+Mitigation: aggregated summary includes min/max/median and top 3 sample timestamps; critical instances are still forwarded (no suppression of CRIT-level).  
+Owner: App Tower
+
+Rule name: Storage-DB-Correlation-Suppression (stailab) — optional extra  
+Trigger condition: `stailab` storage latency >100ms AND concurrent `vm-db` `PG-ConnCount` > (max_connections-2). Trigger origin: storage resource (allowed).  
+Suppressed alerts: supplemental storage throughput/latency duplicates for the duration.  
+Duration: 20 minutes.  
+Auto-close condition: storage metrics normalize or DB `PG-ConnCount` drops below threshold.  
+Risk: could mask real storage service failure if DB counters are misreported.  
+Mitigation: include storage platform health as a veto (do not suppress if platform health indicates issue).  
+Owner: Storage Tower
+
+BEFORE vs AFTER COUNT (estimated, target ~10–15 alerts)
+
+- CRITICAL before: 47  
+  CRITICAL after: 6  
+  - Rationale: keep the 4 must-always-fire primaries (ALT-001, ALT-007, ALT-030, ALT-045) + retain `PG-ServiceDegraded` (ALT-042) and one `NSG-FlowDenied` sample to confirm denial trend = 6
+
+- WARNING before: 138  
+  WARNING after: 6  
+  - Rationale: suppress repeated warnings and only keep one representative per tower: `AppErrorRate` spike (first), `PG-ConnCount` approaching threshold (first), `Storage-IOLatency` first occurrence (as info to storage) = ~3; plus some aggregated summaries = total ~6
+
+- INFO before: 95  
+  INFO after: 3  
+  - Rationale: keep key audit/info items: `Bastion-ConnLog` (ALT-006), `NSG-RuleChanged` detail (ALT-002 as info), and one VNet topology change (ALT-003) = 3
+
+- TOTAL before: 280  
+  TOTAL after: 15
+
+GAP ANALYSIS — Missing alert that would have caught the root cause BEFORE symptoms:
+
+Alert name: Detect-NSG-SecurityRule-Write-SourceChange  
+- Signal: Activity Log  
+- Operation name (exact): "Microsoft.Network/networkSecurityGroups/securityRules/write"  
+- Condition: Activity Log event where `authorization.action` == "Microsoft.Network/networkSecurityGroups/securityRules/write" AND the change payload includes modification of `properties.priority` OR `properties.sourceAddressPrefix` (detect when `sourceAddressPrefix` widens or `priority` changes).  
+- Threshold / Evaluation period: Fire on any single matching write operation (Evaluation period: 1 minute).  
+- Severity: Warning  
+- Notification should include: caller (who made the change), timestamp, resourceId, `properties.previousValue` and `properties.newValue` showing before/after `sourceAddressPrefix` and `priority`, and a direct link to execute an immediate rollback command.  
+- Example Azure Monitor Action Rule (JSON sketch):
+```json
+{
+  "name": "Detect-NSG-SecurityRule-Write-SourceChange",
+  "description": "Alert when an NSG security rule is updated changing source or priority",
+  "condition": {
+    "odata.type": "Microsoft.Azure.Management.Monitor.Models.ActivityLogAlertAllOfCondition",
+    "allOf": [
+      { "field": "operationName", "equals": "Microsoft.Network/networkSecurityGroups/securityRules/write" },
+      {
+        "anyOf": [
+          { "field": "properties", "contains": "\"sourceAddressPrefix\"" },
+          { "field": "properties", "contains": "\"priority\"" }
+        ]
+      }
+    ]
+  },
+  "severity": "Warning",
+  "actions": { "actionGroups": [ "/subscriptions/<sub>/resourceGroups/<rg>/providers/microsoft.insights/actionGroups/netops@finbridge" ] }
+}
+```
+
+Notes:
+- This missing Activity Log alert would have paged Network Ops at the time of the NSG edit (09:14:03) and enabled a faster rollback before app connections timed out (ALT-007 at 09:14:47).
+
+Final notes and owner responsibilities:
+- Each suppression rule has a named owner (Network, DBA, App, Storage) who is responsible for post-suppression review and for lifting suppression early if severity increases.  
+- All suppressions auto-expire and no suppression hides initial primary alerts.  
+- Implement suppression as a combination of deduplication + incident-aware suppression (based on same-resource triggers and short durations) to reduce noise while preserving signal.

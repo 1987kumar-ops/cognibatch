@@ -1,0 +1,6 @@
+# Terraform local cache
+**/.terraform/
+
+# Terraform state can contain secrets
+*.tfstate
+*.tfstate.backup
