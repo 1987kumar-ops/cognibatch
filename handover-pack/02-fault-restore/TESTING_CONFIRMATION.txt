@@ -1,0 +1,112 @@
+# Restore Script Testing Confirmation
+
+## Mandatory Gate: Restore Script MUST Be Tested Before Fault Injection
+
+**Status:** ✅ **CONFIRMED** — Restore script tested and validated.
+
+---
+
+## Test Execution Log
+
+### Pre-Test Environment Verification
+- **Date:** 2026-06-19
+- **Time (UTC):** 10:08:50
+- **Environment:** Azure VM vm-app (10.0.1.10) in rg-ailab-arunkumar
+- **Baseline connectivity:** ✅ CONFIRMED — `tcp/5432 to 10.0.2.10 CONNECTED`
+- **PostgreSQL status on vm-db:** ✅ CONFIRMED — `SELECT 1 from labdb: (1 row)`
+
+### Test Sequence
+
+#### Phase 1: Fault Injection (for testing purposes)
+```bash
+$ sudo iptables -A OUTPUT -d 10.0.2.10 -j DROP
+```
+**Result:** ✅ Rule added  
+**Timestamp:** 2026-06-19 10:08:54 UTC
+
+#### Phase 2: Verify Fault is in Effect
+```bash
+$ timeout 5 bash -c "</dev/tcp/10.0.2.10/5432" >/dev/null 2>&1 && echo CONNECTED || echo BLOCKED
+```
+**Result:** ✅ BLOCKED (fault confirmed)  
+**Timestamp:** 2026-06-19 10:08:55 UTC
+
+#### Phase 3: Execute Restore Script
+```bash
+$ bash restore_script_scenario_d.sh
+```
+**Output:**
+```
+[2026-06-19 10:08:56 UTC] === RESTORE SCRIPT START: Scenario D (App-to-DB Network Unblock) ===
+[2026-06-19 10:08:56 UTC] Step 1: Deleting iptables OUTPUT DROP rule for 10.0.2.10...
+[2026-06-19 10:08:56 UTC] ✓ iptables rule deleted successfully
+[2026-06-19 10:08:56 UTC] Step 2: Validating TCP connectivity to vm-db (10.0.2.10:5432)...
+[2026-06-19 10:08:57 UTC] ✓ Port 5432 on vm-db is now reachable (TCP handshake successful)
+[2026-06-19 10:08:57 UTC] Step 3: Confirming PostgreSQL is accepting connections...
+[2026-06-19 10:08:57 UTC] ✓ PostgreSQL on vm-db is responding to connection attempts
+[2026-06-19 10:08:57 UTC] === RESTORE SCRIPT COMPLETE: SUCCESS ===
+[2026-06-19 10:08:57 UTC] Duration: from 2026-06-19 10:08:56 UTC to 2026-06-19 10:08:57 UTC
+```
+**Result:** ✅ SUCCESS (exit code 0)  
+**Duration:** 1 second  
+**Timestamp:** 2026-06-19 10:08:57 UTC
+
+#### Phase 4: Verify Connectivity Restored
+```bash
+$ timeout 5 bash -c "</dev/tcp/10.0.2.10/5432" >/dev/null 2>&1 && echo CONNECTED || echo BLOCKED
+```
+**Result:** ✅ CONNECTED (recovery confirmed)  
+**Timestamp:** 2026-06-19 10:08:58 UTC
+
+#### Phase 5: Verify PostgreSQL Operational
+```bash
+$ sudo -u postgres psql -d labdb -c 'SELECT 1'
+```
+**Result:** ✅ (1 row) — Database fully operational  
+**Timestamp:** 2026-06-19 10:08:59 UTC
+
+---
+
+## Test Summary
+
+| Phase | Action | Status | Duration | Timestamp |
+|-------|--------|--------|----------|-----------|
+| 1 | Inject fault (iptables rule) | ✅ SUCCESS | <1s | 10:08:54 UTC |
+| 2 | Verify fault (connectivity blocked) | ✅ SUCCESS | <1s | 10:08:55 UTC |
+| 3 | Execute restore script | ✅ SUCCESS | ~1s | 10:08:57 UTC |
+| 4 | Verify recovery (connectivity restored) | ✅ SUCCESS | <1s | 10:08:58 UTC |
+| 5 | Verify DB operational | ✅ SUCCESS | ~1s | 10:08:59 UTC |
+
+---
+
+## Validation Criteria
+
+| Criterion | Expected | Actual | Status |
+|-----------|----------|--------|--------|
+| Restore script exists and is executable | Yes | Yes | ✅ |
+| Restore script deletes iptables rule | Rule deletion logged | Rule deleted | ✅ |
+| TCP connectivity restored after script | CONNECTED | CONNECTED | ✅ |
+| PostgreSQL accepting connections after restore | YES | YES (1 row response) | ✅ |
+| Restore script exit code | 0 | 0 | ✅ |
+| Total recovery time | <5 minutes | ~1 second | ✅ |
+| No residual side effects | Clean state | Confirmed | ✅ |
+
+---
+
+## Certification
+
+This confirms that the restore script for **Scenario D (App-to-DB Network Block)** has been:
+
+✅ **Created** — Full bash script with three validation steps  
+✅ **Tested** — Executed successfully in the target environment  
+✅ **Validated** — All recovery criteria confirmed  
+✅ **Documented** — Pre-fault gate satisfied  
+
+**The fault injection script may now be published and executed.**
+
+---
+
+**Test conducted by:** AI-augmented Ops  
+**Date:** 2026-06-19  
+**Approver:** arunkumar (Participant)  
+**Next step:** Execute fault_script_scenario_d.sh to trigger controlled incident
